@@ -3,46 +3,56 @@ import os
 import io
 import base64
 import time
-from PIL import Image, ImageDraw, ImageFont
-import json
-import requests
-# utility function
+from PIL import Image
 import os
-from openai import AzureOpenAI
-
-import json
-import sys
 import os
 import cv2
 import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
 import easyocr
-from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+from util.paddle_ocr_pool import PaddleOCRPool
 import time
 import base64
-
 import os
-import ast
 import torch
 from typing import Tuple, List, Union
 from torchvision.ops import box_convert
-import re
 from torchvision.transforms import ToPILImage
 import supervision as sv
 import torchvision.transforms as T
 from util.box_annotator import BoxAnnotator 
+import os
+import logging
 
+reader = easyocr.Reader(['en'])
+
+# Create a thread-safe pool of PaddleOCR instances
+cpu_count = os.cpu_count() or 1
+pool_size = max(1, min(16, cpu_count * 2))
+paddle_ocr_pool = PaddleOCRPool(
+    pool_size=pool_size,  # Set pool size based on CPU cores
+    lang='en',
+    use_angle_cls=False,
+    use_gpu=True,  # using cuda will conflict with pytorch in the same process
+    show_log=False,
+    max_batch_size=1024,
+    use_dilation=True,  # improves accuracy
+    det_db_score_mode='slow',  # improves accuracy
+    rec_batch_num=1024
+)
+
+import logging
+logger = logging.getLogger("omniparser")
+logger.info(f"Initialized PaddleOCR pool with size {pool_size} (system has {cpu_count} CPU cores)")
+
+# Track OCR processing times for performance tuning
+ocr_processing_metrics = {
+    "total_images_processed": 0,
+    "total_processing_time": 0,
+    "min_processing_time": float('inf'),
+    "max_processing_time": 0
+}
 
 def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2-opt-2.7b", device=None):
     if not device:
@@ -385,12 +395,14 @@ def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.
         conf=box_threshold,
         imgsz=imgsz,
         iou=iou_threshold, # default 0.7
+        verbose=False,
         )
     else:
         result = model.predict(
         source=image,
         conf=box_threshold,
         iou=iou_threshold, # default 0.7
+        verbose=False,
         )
     boxes = result[0].boxes.xyxy#.tolist() # in pixel space
     conf = result[0].boxes.conf
@@ -428,7 +440,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         ocr_bbox = torch.tensor(ocr_bbox) / torch.Tensor([w, h, w, h])
         ocr_bbox=ocr_bbox.tolist()
     else:
-        print('no ocr bbox!!!')
+        # print('no ocr bbox!!!')
         ocr_bbox = None
 
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
@@ -440,7 +452,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     # get the index of the first 'content': None
     starting_idx = next((i for i, box in enumerate(filtered_boxes_elem) if box['content'] is None), -1)
     filtered_boxes = torch.tensor([box['bbox'] for box in filtered_boxes_elem])
-    print('len(filtered_boxes):', len(filtered_boxes), starting_idx)
+    # print('len(filtered_boxes):', len(filtered_boxes), starting_idx)
 
     # get parsed icon local semantics
     time1 = time.time()
@@ -463,7 +475,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     else:
         ocr_text = [f"Text Box ID {i}: {txt}" for i, txt in enumerate(ocr_text)]
         parsed_content_merged = ocr_text
-    print('time to get parsed content:', time.time()-time1)
+    # print('time to get parsed content:', time.time()-time1)
 
     filtered_boxes = box_convert(boxes=filtered_boxes, in_fmt="xyxy", out_fmt="cxcywh")
 
@@ -509,12 +521,16 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
+    
+    ocr_start_time = time.time()
+    
     if use_paddleocr:
         if easyocr_args is None:
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
+        # Use the thread-safe PaddleOCRPool instead of a single instance
+        result = paddle_ocr_pool.process_image(image_np, cls=False)[0]
         coord = [item[0] for item in result if item[1][1] > text_threshold]
         text = [item[1][0] for item in result if item[1][1] > text_threshold]
     else:  # EasyOCR
@@ -523,6 +539,69 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         result = reader.readtext(image_np, **easyocr_args)
         coord = [item[0] for item in result]
         text = [item[1] for item in result]
+    
+    # Update OCR processing metrics
+    ocr_processing_time = time.time() - ocr_start_time
+    ocr_processing_metrics["total_images_processed"] += 1
+    ocr_processing_metrics["total_processing_time"] += ocr_processing_time
+    ocr_processing_metrics["min_processing_time"] = min(ocr_processing_metrics["min_processing_time"], ocr_processing_time)
+    ocr_processing_metrics["max_processing_time"] = max(ocr_processing_metrics["max_processing_time"], ocr_processing_time)
+    
+    # Log OCR processing metrics periodically (every 20 images)
+    if ocr_processing_metrics["total_images_processed"] % 20 == 0:
+        avg_time = ocr_processing_metrics["total_processing_time"] / ocr_processing_metrics["total_images_processed"]
+        
+        # Get detailed pool utilization metrics
+        pool_metrics = paddle_ocr_pool.get_utilization() if hasattr(paddle_ocr_pool, "get_utilization") else {}
+        
+        # Generate tuning suggestions based on both time and utilization
+        tuning_suggestion = ""
+        batch_suggestion = ""
+
+        if pool_metrics:
+            max_utilization = pool_metrics.get("max_utilization_pct", 0)
+            current_utilization = pool_metrics.get("utilization_pct", 0)
+            
+            if max_utilization > 80 and pool_size < cpu_count:
+                tuning_suggestion = f" | Suggestion: Increase pool_size (current: {pool_size}, max util: {max_utilization}%)"
+            elif max_utilization < 30 and pool_size > 2:
+                tuning_suggestion = f" | Suggestion: Decrease pool_size (current: {pool_size}, max util: {max_utilization}%)"
+            elif avg_time > 0.5 and current_utilization > 70:
+                tuning_suggestion = f" | Suggestion: Increase pool_size for better throughput (current: {pool_size})"
+
+        # Add batch size suggestions for PaddleOCR
+        time_variance = ocr_processing_metrics["max_processing_time"] / (ocr_processing_metrics["min_processing_time"] + 0.001)
+
+        # Get current batch sizes from pool metrics or use defaults
+        current_batch_size = pool_metrics.get("max_batch_size", 1024) if pool_metrics else 1024
+        rec_batch_num = pool_metrics.get("rec_batch_num", 1024) if pool_metrics else 1024
+        current_utilization = pool_metrics.get("utilization_pct", 0) if pool_metrics else 0
+
+        if avg_time > 2.0 and time_variance > 3.0:
+            # High processing time and high variance suggest reducing batch sizes
+            batch_suggestion = f" | Suggestion: Reduce OCR batch sizes (current: max_batch_size={current_batch_size}, rec_batch_num={rec_batch_num})"
+        elif avg_time < 0.1 and current_utilization < 40:
+            # Fast processing with low utilization suggests opportunity to increase batch size
+            batch_suggestion = f" | Suggestion: Consider increasing OCR batch sizes for better throughput"
+
+        # Format the utilization metrics for logging if available
+        utilization_info = ""
+        if pool_metrics:
+            utilization_info = (
+                f" | Current util: {pool_metrics.get('utilization_pct', 0)}% | "
+                f"Max util: {pool_metrics.get('max_utilization_pct', 0)}% | "
+                f"Total requests: {pool_metrics.get('total_requests', 0)}"
+            )
+        
+        logger.info(
+            f"PaddleOCR metrics - Images processed: {ocr_processing_metrics['total_images_processed']} | "
+            f"Avg time: {avg_time:.3f}s | Min: {ocr_processing_metrics['min_processing_time']:.3f}s | "
+            f"Max: {ocr_processing_metrics['max_processing_time']:.3f}s | Pool size: {pool_size}"
+            f"{utilization_info}"
+            f"{tuning_suggestion}"
+            f"{batch_suggestion}"
+        )
+    
     if display_img:
         opencv_img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         bb = []
